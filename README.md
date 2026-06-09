@@ -472,7 +472,6 @@ Upadhyay A. *et al.* Chapter 5 in *Big data analytics using contemporary algorit
 
 ## Affiliation
 
-Developed at the **Structural Topology and Computational Biology Laboratory (STLAB)**
 CSIR – Indian Institute of Chemical Biology, Kolkata, India
 AcSIR — Academy of Scientific and Innovative Research
 
