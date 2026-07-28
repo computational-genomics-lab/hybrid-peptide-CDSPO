@@ -4,7 +4,8 @@ training/evaluate.py
 Evaluation of generated peptides against reference distributions.
 
 Provides:
-- Score distribution comparison (generated vs. training positives vs. random)
+- Score distribution comparison (generated vs. training positives vs.
+  training negatives vs. random)
 - Novelty metrics (edit distance to nearest training sequence)
 - Baseline: random peptide population at the same length distribution
 """
@@ -50,7 +51,7 @@ def generate_random_peptides(
 def nearest_training_distance(
     generated_seqs: List[str],
     training_seqs: List[str],
-    n_sample: int = 200,
+    n_sample: Optional[int] = None,
 ) -> np.ndarray:
     """
     For each generated sequence, compute the normalised edit distance
@@ -60,14 +61,30 @@ def nearest_training_distance(
     0.0 = identical to a training sequence (memorised)
     1.0 = maximally different
 
-    n_sample: subsample training sequences for speed on large datasets.
+    n_sample: if provided, subsamples the training set to this many
+    reference sequences for speed. Default is None — the FULL training
+    set is used. A memorisation/novelty claim computed against a random
+    200-sequence subsample of a much larger training pool is not
+    defensible: a generated sequence could be a near-exact copy of a
+    training sequence that simply wasn't in the sample, understating
+    memorisation. Pass n_sample explicitly to opt into subsampling on a
+    very large training pool where full comparison is too slow.
     """
     rng = np.random.default_rng(0)
-    if len(training_seqs) > n_sample:
+    if n_sample is not None and len(training_seqs) > n_sample:
         ref = list(rng.choice(len(training_seqs), size=n_sample, replace=False))
         ref_seqs = [training_seqs[i] for i in ref]
+        logger.info(
+            "nearest_training_distance: subsampled %d of %d training "
+            "sequences (n_sample explicitly set)", n_sample, len(training_seqs),
+        )
     else:
         ref_seqs = training_seqs
+        logger.info(
+            "nearest_training_distance: using full training set (%d sequences) "
+            "as reference — this may take a while for large pools.",
+            len(ref_seqs),
+        )
 
     distances = []
     for gen_seq in generated_seqs:
@@ -88,14 +105,20 @@ def compare_score_distributions(
     training_pos_seqs: List[str],
     predict_amp: Callable,
     predict_cpp: Callable,
+    amp_training_neg_seqs: Optional[List[str]] = None,
+    cpp_training_neg_seqs: Optional[List[str]] = None,
     output_path: Optional[str] = None,
     n_random: int = 500,
 ) -> pd.DataFrame:
     """
-    Compare AMP and CPP score distributions across three populations:
+    Compare AMP and CPP score distributions across up to five populations:
     1. Generated sequences (from CVAE + optimisation)
     2. Training positives (experimental AMPs used for generator training)
-    3. Random baseline (uniform AA composition, matched length distribution)
+    3. AMP training negatives (DBAASP MIC>=256 ug/mL against >=3 species —
+       same file as amp_neg_path). Optional: pass None to skip.
+    4. CPP training negatives (same file as cpp_neg_path). Optional: pass
+       None to skip.
+    5. Random baseline (uniform AA composition, matched length distribution)
 
     Reports summary statistics and optionally saves to CSV.
     """
@@ -103,12 +126,18 @@ def compare_score_distributions(
     random_seqs   = generate_random_peptides(n_random, train_lengths, seed=0)
     random_seqs   = [s for s in random_seqs if is_canonical(s)]
 
-    rows = []
-    for population, seqs in [
+    populations = [
         ('generated', generated_seqs),
         ('training_positives', training_pos_seqs[:n_random]),
-        ('random_baseline', random_seqs),
-    ]:
+    ]
+    if amp_training_neg_seqs:
+        populations.append(('amp_training_negatives', amp_training_neg_seqs[:n_random]))
+    if cpp_training_neg_seqs:
+        populations.append(('cpp_training_negatives', cpp_training_neg_seqs[:n_random]))
+    populations.append(('random_baseline', random_seqs))
+
+    rows = []
+    for population, seqs in populations:
         if not seqs:
             continue
         amp_s = predict_amp(seqs)
@@ -152,6 +181,13 @@ def novelty_report(
 ) -> dict:
     """
     Compute novelty statistics for generated sequences.
+
+    generated_seqs MUST be the FINAL candidate set (post-filter,
+    post-diversity-control — what actually ends up in candidates.csv),
+    not an intermediate generation/mutation pool. Reporting novelty on
+    an unfiltered intermediate pool describes sequences the user never
+    sees and overstates or understates the novelty of what's actually
+    delivered, depending on how the filters correlate with memorisation.
 
     A sequence with distance 0.0 to the training set was memorised.
     High novelty (distance > 0.5) with high scores indicates genuine
