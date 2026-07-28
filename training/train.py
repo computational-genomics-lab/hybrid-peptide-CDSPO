@@ -3,6 +3,20 @@ training/train.py
 ==================
 Top-level training orchestration for AMP and CPP classifiers + CVAE generator.
 
+CORE DESIGN — classifier vs. generator use different positive sets:
+  The classifier trains on a 3:1 pos:neg matched subsample
+  (amp_pos_clf.csv / cpp_pos_clf.csv). At 27:1 (the full positive pool)
+  the AMP classifier scored random peptides 0.862 — non-discriminative.
+  3:1 is the regime where the CPP classifier is known to work (0.392).
+  The generator (CVAE) has no such constraint and trains on the full
+  HemoPI2-filtered pool (amp_generator_positives.csv /
+  cpp_generator_positives.csv) for maximum sequence diversity.
+  See train_generator() below and data.loader.load_generator_positives().
+
+  AMP negatives are DBAASP peptides (MIC >=256 ug/mL, >=3 species,
+  100% experimentally measured) — not UniProt. UniProt cytosolic proteins
+  were evaluated and rejected as an AMP negative source.
+
 Evaluation reporting:
 - CV ROC-AUC (training fold only)
 - Validation ROC-AUC, PR-AUC, Brier score (calibration quality)
@@ -48,12 +62,23 @@ def train_amp_classifier(
     data_cfg: dict,
     model_cfg: dict,
     seed: int = 42,
-) -> Tuple[Callable, pd.DataFrame]:
+) -> Tuple[Callable, Callable, pd.DataFrame]:
     """
     Train, calibrate, and evaluate the AMP classifier.
 
-    Returns (predict_fn, amp_train_df) where amp_train_df is the training
-    split used to train the CVAE generator (positives only).
+    Returns (predict_calibrated, predict_raw, amp_train_df).
+      predict_calibrated — isotonic-calibrated probability. Use for
+        reporting and any final candidate score.
+      predict_raw — uncalibrated ensemble average. Use for generation
+        steering — calibration on a ~200-sequence validation split can
+        collapse to a coarse step function with no usable gradient for
+        softmax-weighted seed selection. See models/classifier.py
+        train_predictor() docstring for the full explanation.
+    amp_train_df is the classifier's training-split positives — kept
+    for diagnostics only. It is NOT used to train the CVAE generator;
+    the generator trains on the separate, much larger
+    amp_generator_positives.csv pool (see data.load_generator_positives()
+    and train_generator()).
     """
     logger.info("=" * 60)
     logger.info("AMP CLASSIFIER TRAINING")
@@ -62,8 +87,8 @@ def train_amp_classifier(
     dataset = build_amp_dataset(
         pos_path=amp_pos_path,
         neg_path=amp_neg_path,
-        min_len=data_cfg.get('min_len', 5),
-        max_len=data_cfg.get('max_len', 60),
+        min_len=data_cfg.get('amp_min_len', 5),
+        max_len=data_cfg.get('amp_max_len', 50),
     )
 
     train_df, val_df, test_df = stratified_split(
@@ -73,7 +98,7 @@ def train_amp_classifier(
         seed=seed,
     )
 
-    predict_amp, val_metrics = train_predictor(
+    predict_amp_cal, predict_amp_raw, val_metrics = train_predictor(
         train_seqs=train_df['sequence'].tolist(),
         train_labels=train_df['label'].values,
         val_seqs=val_df['sequence'].tolist(),
@@ -83,9 +108,10 @@ def train_amp_classifier(
         calibration_method=model_cfg.get('calibration_method', 'isotonic'),
     )
 
-    # Final test evaluation (called ONCE here)
+    # Test-set metrics (ROC-AUC, PR-AUC, Brier, calibration curve) must use
+    # the CALIBRATED function — these are meaningless on raw scores.
     test_metrics = evaluate_on_test(
-        predict_amp,
+        predict_amp_cal,
         test_df['sequence'].tolist(),
         test_df['label'].values,
     )
@@ -98,9 +124,9 @@ def train_amp_classifier(
                 test_metrics['test_pr_auc'],
                 test_metrics['test_brier'])
 
-    # Return training positives for CVAE
+    # Return training positives for diagnostics (not used by the CVAE)
     amp_train_pos = train_df[train_df['label'] == 1].reset_index(drop=True)
-    return predict_amp, amp_train_pos
+    return predict_amp_cal, predict_amp_raw, amp_train_pos
 
 
 # =============================================================================
@@ -114,9 +140,12 @@ def train_cpp_classifier(
     data_cfg: dict,
     model_cfg: dict,
     seed: int = 42,
-) -> Callable:
+) -> Tuple[Callable, Callable]:
     """
     Train, calibrate, and evaluate the CPP classifier.
+
+    Returns (predict_calibrated, predict_raw) — see train_amp_classifier()
+    docstring for why both are needed.
     """
     logger.info("=" * 60)
     logger.info("CPP CLASSIFIER TRAINING")
@@ -125,8 +154,8 @@ def train_cpp_classifier(
     dataset = build_cpp_dataset(
         cpp_path=cpp_path,
         neg_path=cpp_neg_path,
-        min_len=data_cfg.get('min_len', 5),
-        max_len=data_cfg.get('max_len', 60),
+        min_len=data_cfg.get('cpp_min_len', 5),
+        max_len=data_cfg.get('cpp_max_len', 30),
     )
 
     train_df, val_df, test_df = stratified_split(
@@ -136,7 +165,7 @@ def train_cpp_classifier(
         seed=seed,
     )
 
-    predict_cpp, val_metrics = train_predictor(
+    predict_cpp_cal, predict_cpp_raw, val_metrics = train_predictor(
         train_seqs=train_df['sequence'].tolist(),
         train_labels=train_df['label'].values,
         val_seqs=val_df['sequence'].tolist(),
@@ -147,7 +176,7 @@ def train_cpp_classifier(
     )
 
     test_metrics = evaluate_on_test(
-        predict_cpp,
+        predict_cpp_cal,
         test_df['sequence'].tolist(),
         test_df['label'].values,
     )
@@ -160,7 +189,7 @@ def train_cpp_classifier(
                 test_metrics['test_pr_auc'],
                 test_metrics['test_brier'])
 
-    return predict_cpp
+    return predict_cpp_cal, predict_cpp_raw
 
 
 # =============================================================================
@@ -168,22 +197,32 @@ def train_cpp_classifier(
 # =============================================================================
 
 def train_generator(
-    amp_train_positives: pd.DataFrame,
+    seqs: list,
     generator_cfg: dict,
     seed: int = 42,
 ):
     """
-    Train the CVAE on AMP positive training sequences.
+    Train the CVAE on the generator-positives pool.
+
+    CORE DESIGN: `seqs` must come from amp_generator_positives.csv /
+    cpp_generator_positives.csv (via data.loader.load_generator_positives()),
+    NOT from the classifier's train split. The classifier trains on a
+    3:1-matched subsample (1,005 AMP / 651 CPP positives); the generator
+    needs the full HemoPI2-filtered pool (9,205 AMP / 652 CPP) for sequence
+    diversity. Passing classifier positives here silently starves the CVAE
+    down to ~700 training sequences instead of ~9,800 — this was a real
+    regression in an earlier version of this pipeline. Caller (main.py) is
+    responsible for loading and combining the AMP+CPP generator pools before
+    calling this function; this function trains a single CVAE on whatever
+    list it is given.
 
     Selects PyTorch backend if available; falls back to NumPy.
-    Note: generator is trained only on training-set positives, never on
-    validation or test sequences.
     """
     logger.info("=" * 60)
     logger.info("CVAE GENERATOR TRAINING")
     logger.info("=" * 60)
+    logger.info("Generator training pool size: %d sequences", len(seqs))
 
-    seqs    = amp_train_positives['sequence'].tolist()
     lengths = [len(s) for s in seqs]
     max_len = int(np.percentile(lengths, 90))
     max_len = min(max(max_len, 15), generator_cfg.get('max_len', 50))
