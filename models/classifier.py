@@ -191,13 +191,25 @@ def train_predictor(
     k: int = 3,
     n_components: int = 64,
     calibration_method: str = 'isotonic',
-) -> Tuple[object, dict]:
+) -> Tuple[object, object, dict]:
     """
     Train an ensemble classifier and calibrate on the validation set.
 
     Returns:
-      predict_fn  — callable(seqs: list[str]) → np.ndarray of probabilities
-      metrics     — dict with CV ROC-AUC, val ROC-AUC, PR-AUC, Brier
+      predict_calibrated — callable(seqs) → calibrated probabilities.
+        Use for validation/test metrics, calibration curves, and any
+        FINAL reported score. Reliability-guaranteed but can collapse
+        to a coarse step function on small validation splits (isotonic
+        + few hundred samples is a known degenerate regime) — do not
+        use this for anything that needs a gradient/ranking signal.
+      predict_raw — callable(seqs) → uncalibrated ensemble average.
+        Use for generation steering (softmax seed sampling) and any
+        in-loop filtering/optimisation where relative score spread
+        matters more than calibrated interpretability.
+      metrics — dict with CV ROC-AUC, val ROC-AUC, PR-AUC, Brier, and
+        val_calibrated_unique_scores / val_raw_unique_scores (watch
+        these — a low calibrated count means the plateau problem above
+        is live on your data).
 
     Protocol:
       1. 5-fold stratified CV on training set → CV ROC-AUC
@@ -252,11 +264,19 @@ def train_predictor(
     logger.info("Calibrating on validation set...")
 
     def _calibrate(pipe, X_val, y_val, method):
-        cal = CalibratedClassifierCV(
-            estimator=pipe,
-            cv='prefit',
-            method=method,
-        )
+        """
+        Calibrate an already-fitted pipeline on held-out validation data.
+
+        sklearn >=1.6 removed CalibratedClassifierCV(cv='prefit') in favour
+        of wrapping the fitted estimator in sklearn.frozen.FrozenEstimator.
+        sklearn <1.6 still requires cv='prefit'. Support both so this
+        doesn't silently break on whichever sklearn happens to be installed.
+        """
+        try:
+            from sklearn.frozen import FrozenEstimator  # sklearn >= 1.6
+            cal = CalibratedClassifierCV(FrozenEstimator(pipe), method=method)
+        except ImportError:
+            cal = CalibratedClassifierCV(estimator=pipe, cv='prefit', method=method)
         cal.fit(X_val, y_val)
         return cal
 
@@ -264,14 +284,40 @@ def train_predictor(
     mlp_cal = _calibrate(mlp_pipe, X_val, y_val, calibration_method)
     rf_cal  = _calibrate(rf_pipe,  X_val, y_val, calibration_method)
 
-    # -- Evaluate on validation set ----------------------------------------
-    def _ensemble_proba(seqs):
+    # -- Two scoring functions, two different jobs -------------------------
+    # CRITICAL: isotonic calibration on a small validation split (~200
+    # sequences here) is a well-documented degenerate-plateau regime —
+    # PAV pools adjacent bins aggressively with few negatives, producing
+    # a coarse step function. Averaging three such step functions can
+    # narrow, not widen, the effective output range. If the generation
+    # loop's softmax-weighted seed selection steers on THIS score, ties
+    # on the plateau make softmax(scores/T) ~uniform regardless of
+    # temperature — the "guided" mutation loop degenerates to a random
+    # walk. See diag/check_calibration_spread.py to verify this directly
+    # on your data before relying on this explanation.
+    #
+    # predict_calibrated: reliability-guaranteed probability. Use for
+    #   validation/test metrics, calibration curves, and the FINAL
+    #   candidate scores reported to the user.
+    # predict_raw: uncalibrated ensemble average of the three base
+    #   pipelines' predict_proba, still bounded [0,1] but with full
+    #   continuous discriminative signal preserved (no PAV binning).
+    #   Use for generation steering (softmax seed sampling) and the
+    #   in-loop biological filter thresholds, where relative ordering
+    #   and score spread matter more than calibrated interpretability.
+    def _ensemble_proba_calibrated(seqs):
         p_gbm = gbm_cal.predict_proba(seqs)[:, 1]
         p_mlp = mlp_cal.predict_proba(seqs)[:, 1]
         p_rf  = rf_cal.predict_proba(seqs)[:, 1]
         return (p_gbm + p_mlp + p_rf) / 3.0
 
-    p_val = _ensemble_proba(X_val)
+    def _ensemble_proba_raw(seqs):
+        p_gbm = gbm_pipe.predict_proba(seqs)[:, 1]
+        p_mlp = mlp_pipe.predict_proba(seqs)[:, 1]
+        p_rf  = rf_pipe.predict_proba(seqs)[:, 1]
+        return (p_gbm + p_mlp + p_rf) / 3.0
+
+    p_val = _ensemble_proba_calibrated(X_val)
     roc_auc = roc_auc_score(y_val, p_val)
     pr_auc  = average_precision_score(y_val, p_val)
     brier   = brier_score_loss(y_val, p_val)
@@ -280,6 +326,27 @@ def train_predictor(
         roc_auc, pr_auc, brier,
     )
 
+    # Log the raw-vs-calibrated spread on validation right here, so the
+    # plateau problem (if present) shows up in every training run's logs
+    # without needing a separate diagnostic pass.
+    p_val_raw = _ensemble_proba_raw(X_val)
+    logger.info(
+        "Calibrated val score spread : unique=%d/%d  std=%.4f",
+        len(np.unique(p_val)), len(p_val), p_val.std(),
+    )
+    logger.info(
+        "Raw val score spread        : unique=%d/%d  std=%.4f",
+        len(np.unique(p_val_raw)), len(p_val_raw), p_val_raw.std(),
+    )
+    if len(np.unique(p_val)) < 15:
+        logger.warning(
+            "Calibrated scores collapsed to %d distinct values on "
+            "validation. Generation MUST steer on predict_raw, not "
+            "predict_calibrated, or softmax seed selection will be "
+            "near-uniform regardless of temperature.",
+            len(np.unique(p_val)),
+        )
+
     metrics = {
         'gbm_cv_roc_auc': float(gbm_cv_scores.mean()),
         'mlp_cv_roc_auc': float(mlp_cv_scores.mean()),
@@ -287,9 +354,11 @@ def train_predictor(
         'val_roc_auc':    float(roc_auc),
         'val_pr_auc':     float(pr_auc),
         'val_brier':      float(brier),
+        'val_calibrated_unique_scores': int(len(np.unique(p_val))),
+        'val_raw_unique_scores':        int(len(np.unique(p_val_raw))),
     }
 
-    return _ensemble_proba, metrics
+    return _ensemble_proba_calibrated, _ensemble_proba_raw, metrics
 
 
 # =============================================================================
