@@ -159,8 +159,10 @@ def softmax_sample_seeds(
 
 def generate_and_optimise(
     generator,
-    predict_amp: Callable,
-    predict_cpp: Callable,
+    predict_amp_raw: Callable,
+    predict_cpp_raw: Callable,
+    predict_amp_cal: Callable,
+    predict_cpp_cal: Callable,
     n_initial: int = 3000,
     n_optimise_rounds: int = 5,
     top_k: int = 300,
@@ -172,17 +174,39 @@ def generate_and_optimise(
     """
     Full generation + multi-round guided mutation pipeline.
 
-    Returns a list of (sequence, amp_score, cpp_score, combined_score) tuples.
+    Returns a list of (sequence, amp_score, cpp_score, combined_score)
+    tuples where the scores are CALIBRATED probabilities — see below.
+
+    CRITICAL: two different scales are in play here, and mixing them is
+    a bug that was live in this function until this fix.
+      - predict_amp_raw / predict_cpp_raw drive every round's softmax
+        seed selection and mutant scoring. Calibrated scores can collapse
+        to a coarse step function on small validation splits (see
+        models/classifier.py train_predictor() docstring), which flattens
+        the softmax gradient the optimisation loop depends on. Raw scores
+        preserve full continuous discriminative signal.
+      - predict_amp_cal / predict_cpp_cal are used exactly once, on the
+        final deduplicated pool, right before returning. Downstream
+        consumers of this function's return value — specifically
+        filters.biological.apply_biological_filters(), which thresholds
+        against cfg.min_amp_score / cfg.min_cpp_score (default 0.50) —
+        were written assuming a calibrated probability scale. Handing
+        those thresholds raw ensemble scores silently changes their
+        meaning: 0.50 raw is not "50% calibrated probability of being
+        AMP", and there is no reason the two scales should threshold at
+        the same cutoff. Recalibrating the final pool here, once, keeps
+        that contract correct without needing to touch filters/biological.py.
 
     Protocol:
       1. Generate n_initial sequences from the CVAE
-      2. Score with AMP and CPP predictors
+      2. Score with RAW AMP and CPP predictors
       3. For n_optimise_rounds:
-           a. Sample seeds proportional to softmax(combined_score)
+           a. Sample seeds proportional to softmax(raw combined_score)
            b. Apply n_mutations mutations per seed (multiple mutation counts)
-           c. Score mutants
-           d. Merge mutants into pool, keep diverse top candidates
-      4. Return full pool sorted by combined score
+           c. Score mutants with RAW predictors
+           d. Merge mutants into pool, deduplicate, re-rank on raw score
+      4. Recompute CALIBRATED scores once on the final deduplicated pool
+      5. Return pool sorted by calibrated combined score
     """
     rng = np.random.default_rng(seed)
 
@@ -205,23 +229,23 @@ def generate_and_optimise(
     if not raw_pool:
         raise RuntimeError("Generator produced zero valid sequences.")
 
-    # -- Step 2: Score initial pool ----------------------------------------
-    logger.info("Scoring initial pool...")
-    amp_scores = predict_amp(raw_pool)
-    cpp_scores = predict_cpp(raw_pool)
+    # -- Step 2: Score initial pool (RAW — drives the search) ---------------
+    logger.info("Scoring initial pool (raw ensemble score)...")
+    amp_scores = predict_amp_raw(raw_pool)
+    cpp_scores = predict_cpp_raw(raw_pool)
     combined   = np.sqrt(amp_scores * cpp_scores)
 
-    # Pool: list of (seq, amp, cpp, combined)
+    # Pool: list of (seq, amp, cpp, combined) — RAW scale throughout the loop
     pool = list(zip(raw_pool, amp_scores.tolist(), cpp_scores.tolist(),
                     combined.tolist()))
     pool.sort(key=lambda x: -x[3])
 
     logger.info(
-        "Initial pool — top combined score: %.3f  mean: %.3f",
+        "Initial pool — top combined score (raw): %.3f  mean: %.3f",
         pool[0][3], combined.mean(),
     )
 
-    # -- Step 3: Guided mutation rounds ------------------------------------
+    # -- Step 3: Guided mutation rounds (RAW throughout) --------------------
     for rnd in range(1, n_optimise_rounds + 1):
         logger.info("Optimisation round %d/%d...", rnd, n_optimise_rounds)
 
@@ -240,9 +264,9 @@ def generate_and_optimise(
             logger.warning("Round %d produced no valid mutants; skipping.", rnd)
             continue
 
-        logger.info("  Scoring %d mutants...", len(mutants))
-        m_amp = predict_amp(mutants)
-        m_cpp = predict_cpp(mutants)
+        logger.info("  Scoring %d mutants (raw)...", len(mutants))
+        m_amp = predict_amp_raw(mutants)
+        m_cpp = predict_cpp_raw(mutants)
         m_com = np.sqrt(m_amp * m_cpp)
 
         new_entries = list(zip(mutants, m_amp.tolist(), m_cpp.tolist(),
@@ -262,9 +286,34 @@ def generate_and_optimise(
         pool = deduped
 
         logger.info(
-            "  After round %d: pool size=%d  top score=%.3f",
+            "  After round %d: pool size=%d  top score (raw)=%.3f",
             rnd, len(pool), pool[0][3],
         )
 
     logger.info("Total unique candidates: %d", len(pool))
-    return pool
+
+    # -- Step 4: Recompute CALIBRATED scores once, on the final pool --------
+    # This is the scale filters.biological.apply_biological_filters() and
+    # its cfg.min_amp_score / cfg.min_cpp_score thresholds expect. Search
+    # above never sees this — it only ever optimised against raw scores.
+    logger.info(
+        "Recomputing calibrated scores for %d final candidates "
+        "(this is the scale biological filters threshold against)...",
+        len(pool),
+    )
+    final_seqs = [entry[0] for entry in pool]
+    cal_amp = predict_amp_cal(final_seqs)
+    cal_cpp = predict_cpp_cal(final_seqs)
+    cal_combined = np.sqrt(cal_amp * cal_cpp)
+
+    calibrated_pool = list(zip(
+        final_seqs, cal_amp.tolist(), cal_cpp.tolist(), cal_combined.tolist()
+    ))
+    calibrated_pool.sort(key=lambda x: -x[3])
+
+    logger.info(
+        "Final pool — top combined score (calibrated): %.3f  mean: %.3f",
+        calibrated_pool[0][3], cal_combined.mean(),
+    )
+
+    return calibrated_pool
