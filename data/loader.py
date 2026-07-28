@@ -13,18 +13,21 @@ CRITICAL FIX (synthetic negatives):
   compositions.
 
   Fix:
-  - For CPP: the CellPPD file (CellPPD / Raghavendra) contains ONLY
-    experimentally validated CPP sequences. The columns 'type / CPP /
-    Non-CPP' are predictions from an external predictor — they are NOT
-    experimental labels and must not be used for classification targets.
-    Every row in this file is a positive (label=1). A separate file of
-    real non-CPP sequences is required, same as for AMP negatives.
-  - For AMP: requires a separate file of non-AMP peptides (e.g., from
-    UniProt cytosolic/non-secretory proteins). If not provided, the
-    pipeline raises an informative error directing the user to obtain
-    real negatives. As an interim workaround (explicit, not silent),
-    class_weight='balanced' can be passed to classifiers instead of
-    generating fake negatives.
+  - For CPP: positives (`cpp_pos_clf.csv`) are a curated set of
+    experimentally validated CPPs, one 'sequence' column, all label=1.
+    Negatives (`cpp_neg_clf.csv`) are 42 benchmark non-CPPs + 175 UniProt
+    chain-derived sequences (19% experimental overall), built by
+    process_negatives.py. CPPsite 2.0's non-CPP set was evaluated and
+    rejected — it is randomly generated from Swiss-Prot, not
+    experimentally validated, and must not be used.
+  - For AMP: negatives (`amp_neg_clf.csv`) are DBAASP peptides with
+    MIC >=256 ug/mL against >=3 species — 100% experimentally measured.
+    NOT UniProt-derived. UniProt cytosolic proteins were evaluated and
+    rejected as an AMP negative source (see CORE DESIGN notes in
+    training/train.py) and must not be substituted or supplemented in.
+  - Classifier positives and generator positives are DIFFERENT files
+    (`*_clf.csv` vs `*_generator_positives.csv`). This module reads
+    both; do not use one in place of the other. See load_generator_positives().
 
 CRITICAL FIX (data split):
   Original code never created a held-out test set. Cross-validation
@@ -61,70 +64,145 @@ CPP_ID_COL = 'Protein_ID'
 # Low-level file readers
 # =============================================================================
 
+def _read_sequence_only_csv(path: str, entity_label: str = 'dataset') -> pd.DataFrame:
+    """
+    Generic reader for the re-curated one-column CSVs
+    (amp_pos_clf.csv, amp_neg_clf.csv, cpp_pos_clf.csv, cpp_neg_clf.csv,
+    amp_generator_positives.csv, cpp_generator_positives.csv).
+
+    All six files share the same schema: a single column named 'sequence'.
+    Accepts 'Sequence' (capitalised) as a fallback for compatibility with
+    older manually-curated files that used that header.
+
+    Returns a DataFrame with a single 'Sequence' column (internal
+    convention used throughout this module), regardless of the header
+    casing in the source file.
+    """
+    df = pd.read_csv(path, encoding='latin1')
+    df.columns = [c.strip() for c in df.columns]
+    if AMP_SEQ_COL in df.columns:
+        return df[[AMP_SEQ_COL]]
+    for alt in ['sequence', 'seq', 'SEQUENCE', 'Seq']:
+        if alt in df.columns:
+            return df[[alt]].rename(columns={alt: AMP_SEQ_COL})
+    raise ValueError(
+        f"{entity_label} file must contain a 'sequence' column. "
+        f"Found: {df.columns.tolist()}  (path: {path})"
+    )
+
+
 def _read_amp_positives(path: str) -> pd.DataFrame:
     """
-    Load the AMP positive dataset.
-    Supports .xlsx and .csv.
-    Expected columns: SeqID, Sequence (+ optional score columns).
+    Load the AMP positive dataset (amp_pos_clf.csv — one 'sequence' column).
+    Legacy .xlsx files with 'SeqID'/'Sequence' columns are still supported.
     """
     p = Path(path)
     if p.suffix in ('.xlsx', '.xls'):
         df = pd.read_excel(path)
-    else:
-        df = pd.read_csv(path)
-    df.columns = [c.strip() for c in df.columns]
-    if AMP_SEQ_COL not in df.columns:
-        raise ValueError(
-            f"AMP file must contain a '{AMP_SEQ_COL}' column. "
-            f"Found: {df.columns.tolist()}"
-        )
-    return df
+        df.columns = [c.strip() for c in df.columns]
+        if AMP_SEQ_COL not in df.columns:
+            raise ValueError(
+                f"AMP file must contain a '{AMP_SEQ_COL}' column. "
+                f"Found: {df.columns.tolist()}"
+            )
+        return df
+    return _read_sequence_only_csv(path, entity_label='AMP positives')
 
 
 def _read_amp_negatives(path: str) -> pd.DataFrame:
     """
-    Load non-AMP negative sequences.
-    Minimum requirement: a 'Sequence' column.
-    Recommended source: UniProt non-secretory cytosolic proteins,
-    filtered to 5–60 AA length and canonical residues only.
+    Load non-AMP negative sequences (amp_neg_clf.csv — one 'sequence' column).
+    Also reused as the generic reader for cpp_neg_clf.csv, since both files
+    share the same single-column schema.
+
+    Source (AMP negatives): DBAASP peptides, MIC >=256 ug/mL against
+    >=3 species, 100% experimentally measured. NOT UniProt-derived.
+    Source (CPP negatives, when reused for that purpose): 42 benchmark
+    non-CPPs + 175 UniProt chain-derived sequences (19% experimental),
+    built by process_negatives.py.
     """
     p = Path(path)
     if p.suffix in ('.xlsx', '.xls'):
         df = pd.read_excel(path)
-    else:
-        df = pd.read_csv(path, encoding='latin1')
-    df.columns = [c.strip() for c in df.columns]
-    if AMP_SEQ_COL not in df.columns:
-        # Try common alternatives
-        for alt in ['sequence', 'seq', 'SEQUENCE', 'Seq']:
-            if alt in df.columns:
-                df = df.rename(columns={alt: AMP_SEQ_COL})
-                break
-        else:
+        df.columns = [c.strip() for c in df.columns]
+        if AMP_SEQ_COL not in df.columns:
             raise ValueError(
-                f"AMP negatives file must contain a 'Sequence' column. "
+                f"Negatives file must contain a '{AMP_SEQ_COL}' column. "
                 f"Found: {df.columns.tolist()}"
             )
-    return df
+        return df
+    return _read_sequence_only_csv(path, entity_label='Negatives')
 
 
 def _read_cpp_dataset(path: str) -> pd.DataFrame:
     """
-    Load the CellPPD-format CPP dataset.
+    Load the CPP positive dataset (cpp_pos_clf.csv — one 'sequence' column).
 
-    All rows are experimentally validated CPP positives.
-    The trailing merged column ('type  CPP  Non-CPP') contains predictions
-    from the CellPPD predictor tool — these are NOT experimental labels
-    and are dropped entirely. Only the sequence column is retained.
+    All rows are experimentally validated CPP positives. This function
+    previously parsed the legacy CellPPD multi-column predictor-output
+    format; the re-curated cpp_pos_clf.csv is a plain single-column file
+    and no longer carries that predictor-output column, so it is read
+    with the same generic reader used for AMP positives.
     """
-    df = pd.read_csv(path, encoding='latin1')
-    df.columns = [
-        c.strip().replace('\xa0', '').replace(' ', '_')
-        for c in df.columns
-    ]
-    # Drop the predictor-output column (last column, merged format)
-    df = df.drop(columns=[df.columns[-1]])
-    return df
+    return _read_sequence_only_csv(path, entity_label='CPP positives')
+
+
+def load_generator_positives(
+    path: str,
+    min_len: int = 5,
+    max_len: int = 50,
+) -> list:
+    """
+    Load and clean a generator-training positive set
+    (amp_generator_positives.csv or cpp_generator_positives.csv).
+
+    CRITICAL: this is a DIFFERENT file from the classifier positives
+    (amp_pos_clf.csv / cpp_pos_clf.csv). The generator trains on the full
+    HemoPI2-filtered positive pool (9,205 for AMP / 652 for CPP), not the
+    3:1-matched classifier subset (1,005 / 651). Do not pass a classifier
+    dataset here, and do not pass this output to build_amp_dataset /
+    build_cpp_dataset.
+
+    Returns a plain list[str] of cleaned, canonical, length-filtered
+    sequences — ready to hand directly to train_generator().
+    """
+    logger.info("Loading generator positives from %s", path)
+    df = _read_sequence_only_csv(path, entity_label='Generator positives')
+    df = _clean_sequences(df, AMP_SEQ_COL, min_len, max_len)
+    seqs = df[AMP_SEQ_COL].tolist()
+    logger.info("Generator positives after cleaning: %d", len(seqs))
+    return seqs
+
+
+def load_negative_sequences(
+    path: str,
+    min_len: int = 5,
+    max_len: int = 50,
+    entity_label: str = 'negatives',
+) -> list:
+    """
+    Load and clean a negative-sequence file (amp_neg_clf.csv or
+    cpp_neg_clf.csv) as a standalone list, independent of the
+    classifier's train/val/test split.
+
+    Use case: evaluation/diagnostics — e.g. checking the classifier's
+    score distribution on its own true negatives (see
+    training.evaluate.compare_score_distributions()'s training_neg_seqs
+    parameter). build_amp_dataset()/build_cpp_dataset() already load
+    and split these same sequences for training; this function reads
+    the same file again but returns a flat, unsplit list, since the
+    training split's val/test negatives aren't individually addressable
+    from outside train_amp_classifier()/train_cpp_classifier().
+
+    Returns a plain list[str] of cleaned, canonical, length-filtered
+    sequences.
+    """
+    logger.info("Loading %s from %s", entity_label, path)
+    df = _read_amp_negatives(path)
+    df = _clean_sequences(df, AMP_SEQ_COL, min_len, max_len)
+    seqs = df[AMP_SEQ_COL].tolist()
+    logger.info("%s after cleaning: %d", entity_label, len(seqs))
+    return seqs
 
 
 # =============================================================================
@@ -154,7 +232,7 @@ def build_amp_dataset(
     pos_path: str,
     neg_path: Optional[str],
     min_len: int = 5,
-    max_len: int = 60,
+    max_len: int = 50,
 ) -> pd.DataFrame:
     """
     Build a labelled AMP dataset.
@@ -174,18 +252,14 @@ def build_amp_dataset(
 
     if neg_path is None or not Path(neg_path).exists():
         raise FileNotFoundError(
-            "No real AMP negative dataset found at path: "
+            "No AMP negative dataset found at path: "
             f"'{neg_path}'.\n"
-            "You MUST provide experimentally validated non-AMP sequences.\n"
-            "Recommended source: UniProt cytosolic proteins (reviewed),\n"
-            "filtered to 5-60 AA, no signal peptides, no antimicrobial\n"
-            "annotations. Download via UniProt REST API:\n"
-            "  https://rest.uniprot.org/uniprotkb/search?"
-            "query=reviewed:true+AND+length:[5+TO+60]"
-            "+AND+NOT+keyword:KW-0929&format=fasta\n"
-            "If you intentionally want to skip negatives and rely on\n"
-            "class_weight='balanced', set amp_neg_path to 'BALANCE_ONLY'\n"
-            "in config.yaml."
+            "AMP negatives must be DBAASP peptides with MIC >=256 ug/mL\n"
+            "against >=3 species (100% experimentally measured). Do NOT\n"
+            "substitute UniProt cytosolic proteins as a negative source —\n"
+            "that source was evaluated and rejected for this project.\n"
+            "Negatives are built by process_negatives.py; run that script\n"
+            "and point amp_neg_path at its amp_neg_clf.csv output."
         )
 
     logger.info("Loading AMP negatives from %s", neg_path)
@@ -225,24 +299,22 @@ def build_cpp_dataset(
     cpp_path: str,
     neg_path: Optional[str],
     min_len: int = 5,
-    max_len: int = 60,
+    max_len: int = 30,
 ) -> pd.DataFrame:
     """
     Build a labelled CPP dataset.
 
-    All sequences in the CellPPD file are experimentally validated CPPs
-    (label=1). The predictor-output columns are discarded. A separate
-    file of real non-CPP sequences is required for the negative class,
-    for the same reason as AMP negatives: using predicted labels or
-    shuffled sequences as negatives produces a biologically invalid model.
-
-    Recommended non-CPP sources:
-      - CPPsite 2.0 non-CPP set: https://crdd.osdd.net/raghava/cppsite/
-      - UniProt cytosolic short peptides with no CPP annotation
+    All sequences in cpp_pos_clf.csv are experimentally validated CPPs
+    (label=1). A separate file of non-CPP sequences is required for the
+    negative class: 42 benchmark non-CPPs + 175 UniProt chain-derived
+    sequences (19% experimental overall), built by process_negatives.py.
+    CPPsite 2.0's non-CPP set was evaluated and rejected for this project
+    — it is randomly generated from Swiss-Prot, not experimentally
+    validated, and must not be used as a substitute.
     """
     logger.info("Loading CPP positives from %s", cpp_path)
     df = _read_cpp_dataset(cpp_path)
-    df = df.rename(columns={CPP_SEQ_COL: 'sequence'})
+    df = df.rename(columns={AMP_SEQ_COL: 'sequence'})
     df = _clean_sequences(df, 'sequence', min_len, max_len)
     df = df[['sequence']].copy()
     df['label'] = 1
@@ -250,14 +322,15 @@ def build_cpp_dataset(
 
     if neg_path is None or not Path(neg_path).exists():
         raise FileNotFoundError(
-            "No real CPP negative dataset found at path: "
+            "No CPP negative dataset found at path: "
             f"'{neg_path}'.\n"
-            "You MUST provide experimentally validated non-CPP sequences.\n"
-            "The CellPPD predictor output columns ('type / CPP / Non-CPP')\n"
-            "are NOT experimental labels and cannot be used as negatives.\n"
-            "Recommended sources:\n"
-            "  - CPPsite 2.0 non-CPP set: https://crdd.osdd.net/raghava/cppsite/\n"
-            "  - UniProt cytosolic peptides with no CPP keyword (KW-0985)"
+            "CPP negatives must be the process_negatives.py output\n"
+            "(42 benchmark non-CPPs + 175 UniProt chain-derived, 19%\n"
+            "experimental). Do NOT substitute CPPsite 2.0's non-CPP set —\n"
+            "that source was evaluated and rejected: it is randomly\n"
+            "generated from Swiss-Prot, not experimentally validated.\n"
+            "Run process_negatives.py and point cpp_neg_path at its\n"
+            "cpp_neg_clf.csv output."
         )
 
     logger.info("Loading CPP negatives from %s", neg_path)
